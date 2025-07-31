@@ -1,0 +1,821 @@
+import cv2
+import numpy as np
+from scipy.spatial import distance
+from view_transformer.view_transformer import ViewTransformer
+from team_assigner import TeamAssigner
+import colorsys
+
+class PassLaneAnalyzer:
+    
+    def __init__(self, field_dimensions=(105, 68), debug=False):
+        self.field_dimensions = field_dimensions
+        self.debug = debug
+        
+        self.quality_threshold = 0.3
+        
+        self.open_lane_color = (0, 255, 0)
+        self.moderate_lane_color = (0, 255, 255)
+        self.risky_lane_color = (0, 0, 255)
+        
+        self.pass_lanes = {}
+        self.perspective_transformer = None
+        
+        self.prev_carrier_id = None
+        self.prev_target_id = None
+        self.frames_with_same_carrier = 0
+        self.min_carrier_consistency_frames = 3
+        self.max_frames_without_carrier = 5
+        
+        self.min_lane_width = 1.0
+        
+        self.max_pass_distance = 30.0
+        
+        self.player_radius = 1.0
+        
+        self.defender_influence_radius = 2.0
+        
+        self.view_transformer = ViewTransformer()
+        
+        self.debug = True
+        
+        self.player_team_lookup = {}
+        
+        self.team_assigner = TeamAssigner()
+        
+    def reset_state(self):
+        self.player_team_lookup = {}
+        
+        self.prev_carrier_id = None
+        self.prev_target_id = None
+        self.frames_with_same_carrier = 0
+        
+        self.pass_lanes = {}
+        
+        if self.debug:
+            print("PassLaneAnalyzer: State reset for new batch.")
+        
+        self.team_color_ranges = {
+            'blue_team': {
+                'hsv_lower': np.array([90, 50, 50]),
+                'hsv_upper': np.array([140, 255, 200]),
+                'team_id': 1,            
+                'rgb_min': np.array([50, 0, 100]),
+                'rgb_max': np.array([200, 100, 255]),
+                'dominant_channel': 0
+            },
+            'green_white_team': {
+                'hsv_lower': np.array([35, 30, 40]),
+                'hsv_upper': np.array([90, 255, 255]),
+                'team_id': 2,
+                'rgb_min': np.array([0, 100, 0]),
+                'rgb_max': np.array([255, 255, 200]),
+                'dominant_channel': 1
+            },
+            'yellow_ref': {
+                'hsv_lower': np.array([15, 100, 150]),
+                'hsv_upper': np.array([40, 255, 255]),
+                'team_id': 3,
+                'rgb_min': np.array([0, 150, 150]),
+                'rgb_max': np.array([50, 255, 255]),
+                'dominant_channel': 2
+            }
+        }
+        
+        self.secondary_color_ranges = {
+            'dark_green': {
+                'hsv_lower': np.array([35, 70, 20]),
+                'hsv_upper': np.array([90, 255, 90]),
+                'team_id': 1
+            },
+            'light_blue': {
+                'hsv_lower': np.array([90, 30, 150]),
+                'hsv_upper': np.array([110, 120, 255]),
+                'team_id': 2
+            },
+            'bright_yellow': {
+                'hsv_lower': np.array([25, 180, 200]),
+                'hsv_upper': np.array([35, 255, 255]),
+                'team_id': 3
+            }
+        }
+        
+        self.player_color_cache = {}
+        
+        self.team_id_history = {}
+    
+    def calculate_pass_lanes(self, tracks, team_ball_control):
+        self.reset_state()
+        
+        pass_lanes_per_frame = []
+        
+        self.tracks = tracks
+        self.team_ball_control = team_ball_control
+        
+        for frame_num in range(len(tracks['players'])):
+            pass_lanes = {}
+            
+            if frame_num >= len(tracks['players']) or not tracks['players'][frame_num]:
+                pass_lanes_per_frame.append(pass_lanes)
+                continue
+                
+            active_possession = False
+            if team_ball_control is not None and frame_num < len(team_ball_control):
+                if team_ball_control[frame_num] > 0:
+                    active_possession = True
+            
+            if not active_possession:
+                if self.debug and frame_num % 50 == 0:
+                    print(f"Frame {frame_num}: No active team possession detected, skipping pass lane analysis")
+                pass_lanes_per_frame.append(pass_lanes)
+                continue
+                
+            ball_carrier = None
+            ball_carrier_team = None
+            
+            for player_id, player_data in tracks['players'][frame_num].items():
+                if 'has_ball' in player_data and player_data['has_ball']:
+                    ball_carrier = player_id
+                    ball_carrier_team = player_data.get('team', None)
+                    break
+            
+            if ball_carrier is None:
+                pass_lanes_per_frame.append(pass_lanes)
+                continue
+                
+            if ball_carrier_team is None:
+                if 'frame' in tracks and frame_num < len(tracks['frame']) and 'bbox' in tracks['players'][frame_num][ball_carrier]:
+                    try:
+                        frame = tracks['frame'][frame_num]
+                        bbox = tracks['players'][frame_num][ball_carrier]['bbox']
+                        ball_carrier_team = self.team_assigner.get_player_team(frame, bbox, ball_carrier)
+                        tracks['players'][frame_num][ball_carrier]['team'] = ball_carrier_team
+                        self.player_team_lookup[ball_carrier] = ball_carrier_team
+                    except Exception as e:
+                        if self.debug:
+                            print(f"Error using TeamAssigner: {e}")
+                            
+                if ball_carrier_team is None:
+                    if ball_carrier in self.player_team_lookup:
+                        ball_carrier_team = self.player_team_lookup[ball_carrier]
+                    elif team_ball_control is not None and frame_num < len(team_ball_control):
+                        ball_carrier_team = team_ball_control[frame_num]
+                
+                if ball_carrier_team is None:
+                    if self.debug and frame_num % 50 == 0:
+                        print(f"Frame {frame_num}: Ball carrier {ball_carrier} has no team, skipping")
+                    pass_lanes_per_frame.append(pass_lanes)
+                    continue
+                    
+                carrier_data = tracks['players'][frame_num][ball_carrier]
+                carrier_data['team'] = ball_carrier_team
+                self.player_team_lookup[ball_carrier] = ball_carrier_team
+                
+            if self.debug and frame_num % 50 == 0:
+                print(f"Frame {frame_num}: Found ball carrier {ball_carrier} (team {ball_carrier_team})")
+            
+            carrier_data = tracks['players'][frame_num][ball_carrier]
+            using_meters = True
+        
+            is_goalie = False
+            if 'is_goalie' in carrier_data:
+                is_goalie = carrier_data['is_goalie']
+            else:
+                if 'position_transformed' in carrier_data and carrier_data['position_transformed'] is not None:
+                    field_pos = carrier_data['position_transformed']
+                    if abs(field_pos[0]) > 40:  # Near goal line
+                        is_goalie = True
+                        if self.debug and frame_num % 50 == 0:
+                            print(f"Frame {frame_num}: Player {ball_carrier} detected as goalkeeper based on position {field_pos}")
+        
+            if 'position_transformed' in carrier_data and carrier_data['position_transformed'] is not None:
+                carrier_position = carrier_data['position_transformed']
+            else:
+                carrier_position = carrier_data.get('position', None)
+                using_meters = False
+            
+                if carrier_position is None:
+                    pass_lanes_per_frame.append(pass_lanes)
+                    continue
+            
+            pass_targets = {}
+            defenders = []
+            
+            # Note: We don't have direct access to frames in the tracks dictionary
+            # so we'll rely on other methods to determine team assignment
+            current_frame = None
+            
+            for player_id, player_data in tracks['players'][frame_num].items():
+                if player_id == ball_carrier:
+                    continue
+                    
+                if ('position_transformed' not in player_data or player_data['position_transformed'] is None) and 'position' not in player_data:
+                    continue
+                
+                if 'position_transformed' in player_data and player_data['position_transformed'] is not None:
+                    player_position = player_data['position_transformed']
+                else:
+                    player_position = player_data.get('position')
+                
+                distance = self._calculate_distance(carrier_position, player_position, using_meters)
+                
+                if distance < 0 or (using_meters and (distance > self.max_pass_distance or distance < 2.0)):
+                    if self.debug and frame_num % 50 == 0:
+                        print(f"Frame {frame_num}: Skipping player {player_id} - distance {distance:.1f}m out of range")
+                    continue
+                elif not using_meters and (distance > 800 or distance < 30):
+                    if self.debug and frame_num % 50 == 0:
+                        print(f"Frame {frame_num}: Skipping player {player_id} - pixel distance {distance:.1f} out of range")
+                    continue
+                
+                
+                player_team = player_data.get('team', None)
+                
+                color_team = self._classify_team_by_color(player_data)
+                
+                if player_team is not None and color_team is not None and player_team != color_team:
+                    if self.debug and frame_num % 50 == 0:
+                        print(f"Frame {frame_num}: Team assignment mismatch for player {player_id}: " 
+                              f"assigned={player_team}, color={color_team}")
+                    
+                    if color_team == 3:  # Yellow referee identified by color
+                        player_team = color_team  # Trust the color classifier for refs
+                        if self.debug and frame_num % 50 == 0:
+                            print(f"Frame {frame_num}: Player {player_id} appears to be a referee based on color")
+                
+                if player_team is None:
+                    if color_team is not None:
+                        player_team = color_team  # Trust color classification
+                    elif player_id in self.player_team_lookup:
+                        player_team = self.player_team_lookup[player_id]  # Use historical assignment
+                
+                # Step 4: Still no team? Default to opposite of ball carrier to be safe
+                # This is the most conservative approach - avoid suggesting passes to unknown players
+                if player_team is None:
+                    player_team = 3 if ball_carrier_team == 1 else 1  # Default to opposite team
+                    if self.debug and frame_num % 50 == 0:
+                        print(f"Frame {frame_num}: Unable to determine team for player {player_id}, defaulting to {player_team}")
+                
+                # Update our lookup for future reference
+                self.player_team_lookup[player_id] = player_team
+                
+                if player_team == 3:
+                    if self.debug and frame_num % 50 == 0:
+                        print(f"Frame {frame_num}: Player {player_id} is a referee, excluding from pass targets")
+                    defenders.append({
+                        'id': player_id,
+                        'position': player_position
+                    })
+                    continue
+                
+                if player_team == ball_carrier_team:
+                    if self.debug and frame_num % 50 == 0:
+                        print(f"Frame {frame_num}: Player {player_id} is a teammate (team {player_team})")
+                    pass_targets[player_id] = {
+                        'position': player_position,
+                        'distance': distance
+                    }
+                else:
+                    if self.debug and frame_num % 50 == 0:
+                        print(f"Frame {frame_num}: Player {player_id} is an opponent (team {player_team})")
+                    defenders.append({
+                        'id': player_id,
+                        'position': player_position
+                    })
+            
+            if not pass_targets:
+                pass_lanes_per_frame.append(pass_lanes)
+                continue
+                
+            for target_id, target_data in pass_targets.items():
+                target_distance = target_data['distance']
+                
+                if using_meters:
+                    if target_distance > self.max_pass_distance or target_distance < 2.0:  # At least 2 meters
+                        if self.debug and frame_num % 50 == 0:
+                            print(f"Frame {frame_num}: Skipping target {target_id} - distance {target_distance:.1f}m out of range")
+                        continue
+                else:
+                    if target_distance > 800 or target_distance < 30:
+                        if self.debug and frame_num % 50 == 0:
+                            print(f"Frame {frame_num}: Skipping target {target_id} - pixel distance {target_distance:.1f}px out of range")
+                        continue
+                
+                carrier_pos = carrier_position
+                target_pos = target_data['position']
+                
+                if (carrier_pos is None or target_pos is None or 
+                    len(carrier_pos) < 2 or len(target_pos) < 2 or
+                    not all(np.isfinite([carrier_pos[0], carrier_pos[1], target_pos[0], target_pos[1]]))):
+                    if self.debug and frame_num % 50 == 0:
+                        print(f"Frame {frame_num}: Skipping target {target_id} - invalid position data")
+                    continue
+                    
+                lane_width, lane_quality = self._calculate_lane_quality(
+                        carrier_position, 
+                        target_data['position'],
+                        defenders,
+                        using_meters
+                    )
+                
+                if is_goalie:
+                    if target_distance > 20 and using_meters:
+                        lane_quality *= 0.7
+                        if self.debug and frame_num % 50 == 0:
+                            print(f"Frame {frame_num}: Applying goalie penalty to target {target_id} - distance {target_distance:.1f}m")
+                
+                # Store lane data
+                pass_targets[target_id]['lane_width'] = lane_width
+                pass_targets[target_id]['lane_quality'] = lane_quality
+                # Store additional data for validation in drawing function
+                pass_targets[target_id]['is_goalie_pass'] = is_goalie
+            
+            best_target_id = None
+            best_lane_quality = -1
+            
+            min_lane_quality = 0.3
+            
+            for target_id, target_data in pass_targets.items():
+                if target_data.get('distance', -1) < 0:
+                    if self.debug and frame_num % 50 == 0:
+                        print(f"Frame {frame_num}: Skipping target {target_id} - invalid distance calculation")
+                    continue
+                    
+                if 'lane_quality' in target_data and target_data['lane_quality'] > best_lane_quality:
+                    if target_data['lane_quality'] >= min_lane_quality:
+                        best_lane_quality = target_data['lane_quality']
+                        best_target_id = target_id
+                    elif self.debug and frame_num % 50 == 0:
+                        print(f"Frame {frame_num}: Target {target_id} has insufficient lane quality: {target_data['lane_quality']:.2f} < {min_lane_quality}")
+            
+            pass_lanes = {
+                'carrier': {
+                    'id': ball_carrier,
+                    'position': carrier_position,
+                    'is_goalie': is_goalie
+                },
+                'best_target': None,
+                'all_targets': pass_targets,
+                'using_meters': using_meters
+            }
+            
+            if best_target_id is not None:
+                pass_lanes['best_target'] = {
+                    'id': best_target_id,
+                    'position': pass_targets[best_target_id]['position'],
+                    'lane_width': pass_targets[best_target_id]['lane_width'],
+                    'lane_quality': pass_targets[best_target_id]['lane_quality'],
+                    'is_goalie_pass': is_goalie
+                }
+                
+                # Debug output for best pass option
+                if self.debug and frame_num % 50 == 0:
+                    print(f"Frame {frame_num}: Best pass option to player {best_target_id} with lane width {pass_targets[best_target_id]['lane_width']:.2f}m and quality {best_lane_quality:.2f}")
+            else:
+                if self.debug and frame_num % 50 == 0:
+                    print(f"Frame {frame_num}: No viable pass target found - all lanes below quality threshold or invalid")
+            
+            pass_lanes_per_frame.append(pass_lanes)
+        
+        print(f"Calculated pass lanes for {len(pass_lanes_per_frame)} frames")
+        return pass_lanes_per_frame
+    
+    def _calculate_distance(self, pos1, pos2, using_meters=True):
+        if pos1 is None or pos2 is None:
+            return -1
+        
+        try:
+            x1, y1 = pos1
+            x2, y2 = pos2
+            
+            if using_meters:
+                if not (-10 <= x1 <= 120) or not (-10 <= y1 <= 80) or \
+                   not (-10 <= x2 <= 120) or not (-10 <= y2 <= 80):
+                    if self.debug:
+                        print(f"Warning: Potentially invalid meter coordinates: {pos1}, {pos2}")
+            else:
+                if not (0 <= x1 <= 1920) or not (0 <= y1 <= 1080) or \
+                   not (0 <= x2 <= 1920) or not (0 <= y2 <= 1080):
+                    if self.debug:
+                        print(f"Warning: Potentially invalid pixel coordinates: {pos1}, {pos2}")
+            
+            return np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+            
+        except (TypeError, ValueError) as e:
+            if self.debug:
+                print(f"Error calculating distance: {e} - pos1: {pos1}, pos2: {pos2}")
+            return -1
+    
+    def _classify_team_by_color(self, player_data, frame=None, batch_frames=None, frame_num=0):
+        player_id = player_data.get('id', 0)
+        
+        # Check if team already assigned and cached
+        if player_id in self.player_color_cache:
+            return self.player_color_cache[player_id]
+        
+        # Check if team info already in player data
+        if 'team' in player_data:
+            team_id = player_data['team']
+            self.player_color_cache[player_id] = team_id
+            return team_id
+        
+        # Use TeamAssigner to get team
+        if frame is not None and 'bbox' in player_data:
+            try:
+                bbox = player_data['bbox']
+                team_id = self.team_assigner.get_player_team(frame, bbox, player_id)
+                self.player_color_cache[player_id] = team_id
+                return team_id
+            except Exception as e:
+                if self.debug:
+                    print(f"Error getting team using TeamAssigner: {e}")
+        
+        # If single frame didn't work, try batch frames
+        if batch_frames is not None and frame_num < len(batch_frames) and 'bbox' in player_data:
+            try:
+                current_frame = batch_frames[frame_num]
+                bbox = player_data['bbox']
+                team_id = self.team_assigner.get_player_team(current_frame, bbox, player_id)
+                self.player_color_cache[player_id] = team_id
+                return team_id
+            except Exception as e:
+                if self.debug:
+                    print(f"Error getting team using TeamAssigner for batch frame: {e}")
+        
+        # Default if all else fails
+        return 1
+    
+    def _calculate_lane_quality(self, carrier_pos, target_pos, defenders, using_meters=True):
+        carrier = np.array(carrier_pos)
+        target = np.array(target_pos)
+        
+        # Calculate pass direction vector
+        pass_vector = target - carrier
+        pass_distance = np.linalg.norm(pass_vector)
+        
+        if pass_distance < 0.001:  # Avoid division by zero
+            return 0, 0
+            
+        pass_direction = pass_vector / pass_distance
+        
+        perpendicular = np.array([-pass_direction[1], pass_direction[0]])
+        
+        base_lane_width = 5.0 if using_meters else 50.0
+        lane_width = base_lane_width
+        
+        for defender in defenders:
+            def_pos = np.array(defender['position'])
+            
+            carrier_to_defender = def_pos - carrier
+            
+            projection_distance = np.dot(carrier_to_defender, pass_direction)
+            
+            if projection_distance < -2 or projection_distance > pass_distance + 2:
+                continue
+                
+            perp_distance = abs(np.dot(carrier_to_defender, perpendicular))
+            
+            if perp_distance < self.defender_influence_radius * 3:
+                influence = max(0, self.defender_influence_radius * 3 - perp_distance) / (self.defender_influence_radius * 3)
+                width_reduction = base_lane_width * influence
+                lane_width = min(lane_width, perp_distance + width_reduction)
+        
+        lane_quality = lane_width / base_lane_width
+        
+        distance_factor = 1.0
+        if using_meters and pass_distance > 15:
+            distance_factor = max(0.5, 1 - ((pass_distance - 15) / 30))
+        
+            return False
+            
+        margin = 100  # pixels
+        height, width = frame_shape[:2]
+        
+        return (-margin <= pos[0] < width + margin and 
+                -margin <= pos[1] < height + margin)
+    
+    def draw_pass_lanes(self, frame, pass_lane_data, frame_num=None):
+        frame_copy = frame.copy()
+        
+        # Skip if no pass lane data or frame is invalid
+        if not pass_lane_data or frame is None or frame.size == 0:
+            if self.debug and frame_num is not None and frame_num % 50 == 0:
+                print(f"Frame {frame_num}: No pass lane data or invalid frame")
+            if hasattr(self, 'frames_with_same_carrier'):
+                self.frames_with_same_carrier = max(0, self.frames_with_same_carrier - 1)
+                if self.frames_with_same_carrier == 0:
+                    self.prev_carrier_id = None
+                    self.prev_target_id = None
+            return self._draw_pass_info_box(frame_copy, None)
+        
+        try:
+            frame_height, frame_width = frame.shape[:2]
+            if frame_height <= 0 or frame_width <= 0:
+                if self.debug:
+                    print(f"Frame {frame_num}: Invalid frame dimensions {frame_width}x{frame_height}")
+                return self._draw_pass_info_box(frame_copy, None)
+        except Exception as e:
+            if self.debug:
+                print(f"Frame {frame_num}: Error getting frame dimensions: {e}")
+            return self._draw_pass_info_box(frame_copy, None)
+            
+        if (frame_num is not None and hasattr(self, 'team_ball_control') and 
+            0 <= frame_num < len(self.team_ball_control)):
+            if self.team_ball_control[frame_num] <= 0:
+                if self.debug and frame_num % 50 == 0:
+                    print(f"Frame {frame_num}: No active ball possession according to team_ball_control")
+                if hasattr(self, 'frames_with_same_carrier'):
+                    self.frames_with_same_carrier = max(0, self.frames_with_same_carrier - 1)
+                return self._draw_pass_info_box(frame_copy, None)
+        
+        carrier_data = pass_lane_data.get('carrier', None)
+        target_data = pass_lane_data.get('best_target', None)
+        
+        if (carrier_data is None or target_data is None or 
+            'position' not in carrier_data or 'position' not in target_data):
+            if self.debug and frame_num is not None and frame_num % 50 == 0:
+                print(f"Frame {frame_num}: Missing carrier or target data")
+            if hasattr(self, 'frames_with_same_carrier'):
+                self.frames_with_same_carrier = max(0, self.frames_with_same_carrier - 1)
+            return self._draw_pass_info_box(frame_copy, None)
+            
+        carrier_pos = carrier_data.get('position')
+        target_pos = target_data.get('position')
+        lane_width = target_data.get('lane_width', 0)
+        lane_quality = target_data.get('lane_quality', 0)
+        using_meters = pass_lane_data.get('using_meters', True)
+        carrier_id = carrier_data.get('id', 'unknown')
+        target_id = target_data.get('id', 'unknown')
+        
+        if hasattr(self, 'prev_carrier_id') and self.prev_carrier_id is not None:
+            if carrier_id != self.prev_carrier_id:
+                self.frames_with_same_carrier = 1
+                
+                if self.debug and frame_num is not None and frame_num % 50 == 0:
+                    print(f"Frame {frame_num}: Carrier changed from {self.prev_carrier_id} to {carrier_id} - waiting for consistency")
+                
+                self.prev_carrier_id = carrier_id
+                return self._draw_pass_info_box(frame_copy, None)
+            else:
+                self.frames_with_same_carrier += 1
+                
+                if self.prev_target_id is not None and target_id != self.prev_target_id:
+                    if self.frames_with_same_carrier < self.min_carrier_consistency_frames:
+                        if self.debug and frame_num is not None and frame_num % 50 == 0:
+                            print(f"Frame {frame_num}: Target changed but carrier not consistent enough yet - waiting")
+                        
+                        self.prev_target_id = target_id
+                        return self._draw_pass_info_box(frame_copy, None)
+        else:
+            self.prev_carrier_id = carrier_id
+            self.frames_with_same_carrier = 1
+            if self.debug and frame_num is not None and frame_num % 50 == 0:
+                print(f"Frame {frame_num}: First detection of carrier {carrier_id} - initializing tracking")
+            return self._draw_pass_info_box(frame_copy, None)
+        
+        self.prev_target_id = target_id
+        
+        is_goalie_pass = carrier_data.get('is_goalie', False)
+            
+        if is_goalie_pass and self.debug and frame_num is not None and frame_num % 50 == 0:
+            print(f"Frame {frame_num}: Processing goalie pass from player {carrier_id} - applying enhanced validation")
+        
+        if self.debug and frame_num is not None and frame_num % 50 == 0:
+            print(f"Frame {frame_num}: Drawing pass lane from {carrier_id} to {target_id}")
+            print(f"  Carrier pos: {carrier_pos}, Target pos: {target_pos}")
+            print(f"  Lane width: {lane_width:.2f}, Quality: {lane_quality:.2f}")
+        
+        if using_meters:
+            carrier_pixel_pos = self._get_pixel_position(carrier_pos, frame_copy.shape)
+            target_pixel_pos = self._get_pixel_position(target_pos, frame_copy.shape)
+            
+            if self.debug and frame_copy.shape[0] > 500:  # Only print for actual video frames
+                print(f"Player {carrier_id} (carrier) meter pos: {carrier_pos}, pixel pos: {carrier_pixel_pos}")
+                print(f"Player {target_id} (target) meter pos: {target_pos}, pixel pos: {target_pixel_pos}")
+        else:
+            carrier_pixel_pos = carrier_pos if self._is_valid_position(carrier_pos, frame_copy.shape) else None
+            target_pixel_pos = target_pos if self._is_valid_position(target_pos, frame_copy.shape) else None
+        
+        
+        if (carrier_pixel_pos is None or target_pixel_pos is None or 
+            not self._is_valid_position(carrier_pixel_pos, frame_copy.shape) or 
+            not self._is_valid_position(target_pixel_pos, frame_copy.shape)):
+                
+            if self.debug and frame_num is not None and frame_num % 50 == 0:
+                print(f"Frame {frame_num}: Invalid pixel positions - carrier: {carrier_pixel_pos}, target: {target_pixel_pos}")
+            return self._draw_pass_info_box(frame_copy, None)
+            
+        dx = carrier_pixel_pos[0] - target_pixel_pos[0]
+        dy = carrier_pixel_pos[1] - target_pixel_pos[1]
+        distance_squared = dx*dx + dy*dy
+        pixel_distance = np.sqrt(distance_squared)
+            
+        min_distance_px = 30   
+        
+        if is_goalie_pass:
+            max_distance_px = min(500, frame_width * 0.6, frame_height * 0.6) 
+                
+            angle_radians = np.arctan2(abs(dy), abs(dx))
+            angle_degrees = np.degrees(angle_radians)
+                
+            if angle_degrees > 75:
+                if self.debug and frame_num is not None and frame_num % 50 == 0:
+                    print(f"Frame {frame_num}: Rejecting goalie pass - too vertical at {angle_degrees:.1f}° ({carrier_id} → {target_id})")
+                return self._draw_pass_info_box(frame_copy, None)
+                    
+            elif angle_degrees > 60:
+                lane_quality *= 0.7  
+                if self.debug and frame_num is not None and frame_num % 50 == 0:
+                    print(f"Frame {frame_num}: Goalie pass at steep angle {angle_degrees:.1f}° - reducing quality")
+        else:
+            max_distance_px = min(600, frame_width * 0.8, frame_height * 0.8)
+        
+        if pixel_distance < min_distance_px or pixel_distance > max_distance_px:
+            if self.debug and frame_num is not None and frame_num % 50 == 0:
+                print(f"Frame {frame_num}: Pass distance out of bounds: {pixel_distance:.1f}px (range: {min_distance_px}-{max_distance_px}px)")
+            return self._draw_pass_info_box(frame_copy, None)
+            
+                
+        max_width_factor = 0.5 if is_goalie_pass else 0.6  
+        max_height_factor = 0.5 if is_goalie_pass else 0.6
+            
+        if abs(dx) > frame_width * max_width_factor or abs(dy) > frame_height * max_height_factor:
+            if self.debug and frame_num is not None and frame_num % 50 == 0:
+                print(f"Frame {frame_num}: Pass spans too much of the field: dx={abs(dx):.0f}, dy={abs(dy):.0f} (max allowed: {frame_width * max_width_factor:.0f}x{frame_height * max_height_factor:.0f})")
+            return self._draw_pass_info_box(frame_copy, None)
+            
+        field_margin = 50 if is_goalie_pass else 100  
+            
+        if (carrier_pixel_pos[0] < -field_margin or carrier_pixel_pos[0] > frame_width + field_margin or
+            carrier_pixel_pos[1] < -field_margin or carrier_pixel_pos[1] > frame_height + field_margin or
+            target_pixel_pos[0] < -field_margin or target_pixel_pos[0] > frame_width + field_margin or
+            target_pixel_pos[1] < -field_margin or target_pixel_pos[1] > frame_height + field_margin):
+            if self.debug and frame_num is not None and frame_num % 50 == 0:
+                print(f"Frame {frame_num}: Player positions outside field bounds")
+                if is_goalie_pass:
+                    print(f"  Goalie pass - carrier: {carrier_pixel_pos}, target: {target_pixel_pos}, frame: {frame_width}x{frame_height}")
+            return self._draw_pass_info_box(frame_copy, None)
+            
+        if (not all(np.isfinite([carrier_pixel_pos[0], carrier_pixel_pos[1], 
+                            target_pixel_pos[0], target_pixel_pos[1]])) or
+            max(abs(carrier_pixel_pos[0]), abs(carrier_pixel_pos[1]), 
+                abs(target_pixel_pos[0]), abs(target_pixel_pos[1])) > 10000):
+            if self.debug and frame_num is not None and frame_num % 50 == 0:
+                print(f"Frame {frame_num}: Invalid coordinate values detected")
+            return self._draw_pass_info_box(frame_copy, None)
+                
+        try:
+            thickness = max(2, min(5, int(lane_quality * 10)))  # Cap thickness
+                
+            if lane_quality > 0.7:
+                color = self.open_lane_color
+            elif lane_quality > 0.4:
+                color = self.moderate_lane_color
+            else:
+                color = self.risky_lane_color
+                
+            cv2.line(
+                frame_copy, 
+                (int(round(carrier_pixel_pos[0])), int(round(carrier_pixel_pos[1]))), 
+                (int(round(target_pixel_pos[0])), int(round(target_pixel_pos[1]))), 
+                color, thickness, lineType=cv2.LINE_AA
+            )
+                
+            cv2.circle(
+                frame_copy, 
+                (int(round(carrier_pixel_pos[0])), int(round(carrier_pixel_pos[1]))), 
+                15, (0, 0, 255), 2, lineType=cv2.LINE_AA
+            )
+            cv2.circle(
+                frame_copy, 
+                (int(round(target_pixel_pos[0])), int(round(target_pixel_pos[1]))), 
+                15, (0, 255, 0), 2, lineType=cv2.LINE_AA
+            )
+            
+            text_scale = 0.5
+            text_thickness = 1
+            
+            carrier_text = f"#{carrier_id}"
+            (text_w, text_h), _ = cv2.getTextSize(carrier_text, cv2.FONT_HERSHEY_SIMPLEX, text_scale, text_thickness)
+            text_x = int(round(carrier_pixel_pos[0] - text_w/2))
+            text_y = int(round(carrier_pixel_pos[1] - 25))  
+            
+            cv2.rectangle(
+                frame_copy,
+                (text_x - 2, text_y - text_h - 2),
+                (text_x + text_w + 2, text_y + 2),
+                (0, 0, 0), -1  
+            )
+            
+            
+            cv2.putText(
+                frame_copy, carrier_text,
+                (text_x, text_y),
+                cv2.FONT_HERSHEY_SIMPLEX, text_scale, (0, 0, 255),
+                text_thickness, lineType=cv2.LINE_AA
+            )
+            
+            target_text = f"#{target_id}"
+            (text_w, text_h), _ = cv2.getTextSize(target_text, cv2.FONT_HERSHEY_SIMPLEX, text_scale, text_thickness)
+            text_x = int(round(target_pixel_pos[0] - text_w/2))
+            text_y = int(round(target_pixel_pos[1] - 25))
+            
+            cv2.rectangle(
+                frame_copy,
+                (text_x - 2, text_y - text_h - 2),
+                (text_x + text_w + 2, text_y + 2),
+                (0, 0, 0), -1  
+            )
+            
+            cv2.putText(
+                frame_copy, target_text,
+                (text_x, text_y),
+                cv2.FONT_HERSHEY_SIMPLEX, text_scale, (0, 255, 0),
+                text_thickness, lineType=cv2.LINE_AA
+            )
+            
+            frame_copy = self._draw_pass_info_box(frame_copy, {
+                'width': lane_width,
+                'quality': lane_quality,
+                'using_meters': using_meters
+            })
+            
+        except Exception as e:
+            if self.debug:
+                import traceback
+                print(f"Error drawing pass lanes: {e}")
+                print(traceback.format_exc())
+            frame_copy = self._draw_pass_info_box(frame_copy, None)
+        
+        return frame_copy
+    
+    def _get_pixel_position(self, meter_position, frame_shape):
+        
+        try:
+            inverse_transform = np.linalg.inv(self.view_transformer.persepctive_trasnformer)
+            
+            meter_point = np.array([meter_position[0], meter_position[1], 1.0])
+            
+            pixel_homog = np.dot(inverse_transform, meter_point)
+            
+            if pixel_homog[2] != 0:
+                pixel_x = int(pixel_homog[0] / pixel_homog[2])
+                pixel_y = int(pixel_homog[1] / pixel_homog[2])
+            else:
+                pixel_x = int(meter_position[0])
+                pixel_y = int(meter_position[1])
+            
+            frame_height, frame_width = frame_shape[0], frame_shape[1]
+            
+            pixel_x = max(0, min(frame_width - 1, pixel_x))
+            pixel_y = max(0, min(frame_height - 1, pixel_y))
+            
+            return (pixel_x, pixel_y)
+            
+        except Exception as e:
+            if self.debug:
+                print(f"Error in coordinate transformation: {e}")
+            
+            frame_height, frame_width = frame_shape[0], frame_shape[1]
+            
+            pixel_x = int(meter_position[0] * 10) % frame_width
+            pixel_y = int(meter_position[1] * 10) % frame_height
+            
+            return (pixel_x, pixel_y)
+        
+    def _draw_pass_info_box(self, frame, lane_data):
+        frame_copy = frame.copy()
+        
+        box_width = 550  
+        box_height = 120 
+        start_x = 20
+        start_y = frame.shape[0] - box_height - 100 
+        
+        overlay = frame_copy.copy()
+        cv2.rectangle(overlay, 
+                    (start_x, start_y), 
+                    (start_x + box_width, start_y + box_height),
+                    (255, 255, 255),  
+                    -1)
+        
+        alpha = 0.4
+        cv2.addWeighted(overlay, alpha, frame_copy, 1 - alpha, 0, frame_copy)
+        
+        cv2.putText(frame_copy, "Pass Lane Status", 
+                  (start_x + 10, start_y + 40),
+                  cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 3)
+        
+        if lane_data:
+            if lane_data['quality'] > 0.4:
+                status_text = "Open Pass Lane"
+            else:
+                status_text = "No Open Pass Lane"
+                
+            cv2.putText(frame_copy, status_text, 
+                      (start_x + 10, start_y + 90),
+                      cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 3)
+        else:
+            cv2.putText(frame_copy, "No Open Pass Lane", 
+                      (start_x + 10, start_y + 90),
+                      cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 3)
+                
+        return frame_copy
