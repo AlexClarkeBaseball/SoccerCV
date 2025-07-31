@@ -1,0 +1,254 @@
+import cv2
+import numpy as np
+from team_assigner import TeamAssigner
+
+class DefensivePressureIndex:
+    def __init__(self, debug=False):
+        self.debug = debug
+        
+        self.NO_PASS_LANE_PENALTY = 2.5
+        self.DISTANCE_THRESHOLDS = [5, 10, 20]
+        self.DISTANCE_SCORES = [2.5, 1.5, 1.0]
+        self.MAX_DEFENDERS = 3
+        self.MAX_SCORE = 10.0
+        
+        self.player_team_lookup = {}
+        
+        self.team_assigner = TeamAssigner()
+    
+        self.box_size = (550, 120)
+        self.box_color = (255, 255, 255)
+        self.text_color = (0, 0, 0)
+        self.font = cv2.FONT_HERSHEY_SIMPLEX
+        self.font_scale = 1.0
+        self.line_thickness = 3
+        
+    def calculate_pressure_index(self, tracks, team_ball_control, pass_lanes, frame_num):
+        if frame_num >= len(team_ball_control) or frame_num >= len(tracks['players']):
+            if self.debug:
+                print(f"Frame {frame_num}: Invalid frame number")
+            return 0.0
+            
+        if team_ball_control[frame_num] <= 0:
+            if self.debug and frame_num % 50 == 0:
+                print(f"Frame {frame_num}: No team has ball possession")
+            return 0.0
+            
+        carrier_id = None
+        ball_carrier_team = None
+        players_frame = tracks['players'][frame_num]
+        
+        for player_id, player_data in players_frame.items():
+            if player_data.get('has_ball', False):
+                carrier_id = player_id
+                ball_carrier_team = player_data.get('team')
+                if self.debug and frame_num % 50 == 0:
+                    print(f"Frame {frame_num}: Ball carrier found")
+                break
+                
+        if carrier_id is None:
+            if self.debug and frame_num % 50 == 0:
+                print(f"Frame {frame_num}: No valid ball carrier detected")
+            return 0.0
+            
+        if ball_carrier_team is None:
+            if 'bbox' in players_frame[carrier_id] and 'frame' in tracks:
+                try:
+                    frame = tracks['frame'][frame_num]
+                    bbox = players_frame[carrier_id]['bbox']
+                    ball_carrier_team = self.team_assigner.get_player_team(frame, bbox, carrier_id)
+                    players_frame[carrier_id]['team'] = ball_carrier_team
+                    self.player_team_lookup[carrier_id] = ball_carrier_team
+                except Exception as e:
+                    if self.debug:
+                        print(f"Error getting carrier team using TeamAssigner: {e}")
+                        
+            if ball_carrier_team is None:
+                if carrier_id in self.player_team_lookup:
+                    ball_carrier_team = self.player_team_lookup[carrier_id]
+                else:
+                    ball_carrier_team = team_ball_control[frame_num]
+                    
+                players_frame[carrier_id]['team'] = ball_carrier_team
+                self.player_team_lookup[carrier_id] = ball_carrier_team
+                
+        if ball_carrier_team is None:
+            if self.debug and frame_num % 50 == 0:
+                print(f"Frame {frame_num}: Cannot determine team for ball carrier")
+            return 0.0
+            
+        pressure_score = 0.0
+        
+        has_open_lane = False
+        if frame_num < len(pass_lanes):
+            current_lanes = pass_lanes[frame_num]
+            
+            if current_lanes and 'carrier' in current_lanes and 'best_target' in current_lanes:
+                if current_lanes['carrier'].get('id') == carrier_id and current_lanes['best_target'] is not None:
+                    has_open_lane = True
+                    if self.debug and frame_num % 50 == 0:
+                        target_id = current_lanes['best_target'].get('id')
+                        lane_quality = current_lanes['best_target'].get('lane_quality', 0)
+                        print(f"Frame {frame_num}: Carrier has open pass lane")
+
+        
+        if not has_open_lane:
+            pressure_score += self.NO_PASS_LANE_PENALTY
+            if self.debug and frame_num % 50 == 0:
+                print(f"Frame {frame_num}: No open pass lane")
+        else:
+            if self.debug and frame_num % 50 == 0:
+                print(f"Frame {frame_num}: Open pass lane(s) available")
+        
+        defender_counts = [0, 0, 0]
+        defender_distances = []
+        distance_score = 0.0
+        
+        carrier_data = players_frame[carrier_id]
+        
+        if 'position_transformed' in carrier_data and carrier_data['position_transformed'] is not None:
+            carrier_position = carrier_data['position_transformed']
+            using_meters = True
+        else:
+            carrier_position = carrier_data.get('position')
+            using_meters = False
+            
+            if carrier_position is None:
+                if self.debug and frame_num % 50 == 0:
+                    print(f"Frame {frame_num}: Ball carrier has no valid position")
+                return pressure_score
+        
+        for player_id, player_data in players_frame.items():
+            if player_id == carrier_id:
+                continue
+                
+            player_team = player_data.get('team')
+            
+            if player_team is None:
+                if 'bbox' in player_data and 'frame' in tracks:
+                    try:
+                        frame = tracks['frame'][frame_num]
+                        bbox = player_data['bbox']
+                        player_team = self.team_assigner.get_player_team(frame, bbox, player_id)
+                        player_data['team'] = player_team
+                    except Exception as e:
+                        if self.debug:
+                            print(f"Error getting team using TeamAssigner: {e}")
+                        continue
+            
+            if player_team is None or player_team == 0:
+                continue
+                
+            if player_team == 3:
+                continue
+                
+            if player_team == ball_carrier_team:
+                continue
+                
+            if self.debug and frame_num % 100 == 0:
+                print(f"  Found defender")
+                
+            if 'position_transformed' in player_data and player_data['position_transformed'] is not None:
+                defender_pos = player_data['position_transformed']
+                
+                if using_meters:
+                    distance = np.sqrt((defender_pos[0] - carrier_position[0])**2 + 
+                                      (defender_pos[1] - carrier_position[1])**2)
+                    defender_distances.append(distance)
+                    if self.debug and frame_num % 100 == 0:
+                        print(f"  Defender at distance")
+            elif using_meters == False and 'position' in player_data and player_data['position'] is not None:
+                defender_pos = player_data['position']
+                distance = np.sqrt((defender_pos[0] - carrier_position[0])**2 + 
+                                  (defender_pos[1] - carrier_position[1])**2)
+                distance = distance / 10.0
+                defender_distances.append(distance)
+                if self.debug and frame_num % 100 == 0:
+                    print(f"  Defender at pixel-estimated distance")
+        
+        defender_distances.sort()
+        defender_distances = defender_distances[:self.MAX_DEFENDERS]
+        
+        distance_score = 0.0
+        for distance in defender_distances:
+            for i, threshold in enumerate(self.DISTANCE_THRESHOLDS):
+                if distance <= threshold:
+                    distance_score += self.DISTANCE_SCORES[i]
+                    if self.debug and frame_num % 50 == 0:
+                        print(f"  Defender within {threshold}m, adding {self.DISTANCE_SCORES[i]} points")
+                    break
+        
+        pressure_score += distance_score
+                    
+        pressure_score = min(pressure_score, self.MAX_SCORE)
+        
+        defender_counts = {threshold: 0 for threshold in self.DISTANCE_THRESHOLDS}
+        for distance in defender_distances:
+            for threshold in self.DISTANCE_THRESHOLDS:
+                if distance <= threshold:
+                    defender_counts[threshold] += 1
+                    
+        if self.debug and frame_num % 50 == 0 and defender_distances:
+            print(f"  Defender counts")
+        
+        if self.debug and frame_num % 50 == 0:
+            print(f"Frame {frame_num}: Final Pressure Score")
+        
+        pressure_data = {
+            'total_score': pressure_score,
+            'has_open_lane': has_open_lane,
+            'defender_distances': defender_distances,
+            'defender_counts': defender_counts,
+            'pass_lane_penalty': 0.0 if has_open_lane else self.NO_PASS_LANE_PENALTY,
+            'distance_score': distance_score
+        }
+        
+        return pressure_data
+        
+    
+    def draw_pressure_index(self, frame, pressure_data, show_details=False):
+        if not pressure_data:
+            return frame
+            
+        if isinstance(pressure_data, dict):
+            pressure_score = pressure_data.get('total_score', 0.0)
+            has_open_lane = pressure_data.get('has_open_lane', True)
+        else:
+            pressure_score = float(pressure_data)
+            has_open_lane = None
+            
+        box_width = self.box_size[0]
+        box_height = self.box_size[1]
+        start_x = frame.shape[1] - box_width - 20
+        start_y = 20
+
+        overlay = frame.copy()
+        cv2.rectangle(overlay, 
+                    (start_x, start_y), 
+                    (start_x + box_width, start_y + box_height),
+                    self.box_color, -1)
+        
+        alpha = 0.4
+        cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+        
+        cv2.putText(frame, "Defensive Pressure Index", 
+                   (start_x + 10, start_y + 40), 
+                   self.font, self.font_scale, self.text_color, 
+                   self.line_thickness)
+        
+        status = "LOW"
+        if pressure_score > 7.5:
+            status = "EXTREME"
+        elif pressure_score > 5.0:
+            status = "HIGH"
+        elif pressure_score > 2.5:
+            status = "MEDIUM"
+        
+        status_text = f"Pressure: {status}"
+        cv2.putText(frame, status_text, 
+                   (start_x + 10, start_y + 90), 
+                   self.font, self.font_scale, self.text_color, self.line_thickness)
+        cv2.putText(frame, f"{pressure_score:.1f}/10.0", 
+                   (start_x + box_width - 150, start_y + 90), 
+                   self.font, self.font_scale, self.text_color, self.line_thickness)
+        return frame
