@@ -182,7 +182,7 @@ class PassLaneAnalyzer:
             else:
                 if 'position_transformed' in carrier_data and carrier_data['position_transformed'] is not None:
                     field_pos = carrier_data['position_transformed']
-                    if abs(field_pos[0]) > 40:  # Near goal line
+                    if abs(field_pos[0]) > 40:  
                         is_goalie = True
                         if self.debug and frame_num % 50 == 0:
                             print(f"Frame {frame_num}: Player {ball_carrier} detected as goalkeeper based on position {field_pos}")
@@ -200,8 +200,6 @@ class PassLaneAnalyzer:
             pass_targets = {}
             defenders = []
             
-            # Note: We don't have direct access to frames in the tracks dictionary
-            # so we'll rely on other methods to determine team assignment
             current_frame = None
             
             for player_id, player_data in tracks['players'][frame_num].items():
@@ -237,25 +235,23 @@ class PassLaneAnalyzer:
                         print(f"Frame {frame_num}: Team assignment mismatch for player {player_id}: " 
                               f"assigned={player_team}, color={color_team}")
                     
-                    if color_team == 3:  # Yellow referee identified by color
-                        player_team = color_team  # Trust the color classifier for refs
+                    if color_team == 3:  
+                        player_team = color_team  
                         if self.debug and frame_num % 50 == 0:
                             print(f"Frame {frame_num}: Player {player_id} appears to be a referee based on color")
                 
                 if player_team is None:
                     if color_team is not None:
-                        player_team = color_team  # Trust color classification
+                        player_team = color_team  
                     elif player_id in self.player_team_lookup:
-                        player_team = self.player_team_lookup[player_id]  # Use historical assignment
+                        player_team = self.player_team_lookup[player_id]  
                 
-                # Step 4: Still no team? Default to opposite of ball carrier to be safe
-                # This is the most conservative approach - avoid suggesting passes to unknown players
+                
                 if player_team is None:
-                    player_team = 3 if ball_carrier_team == 1 else 1  # Default to opposite team
+                    player_team = 3 if ball_carrier_team == 1 else 1  
                     if self.debug and frame_num % 50 == 0:
                         print(f"Frame {frame_num}: Unable to determine team for player {player_id}, defaulting to {player_team}")
                 
-                # Update our lookup for future reference
                 self.player_team_lookup[player_id] = player_team
                 
                 if player_team == 3:
@@ -290,7 +286,7 @@ class PassLaneAnalyzer:
                 target_distance = target_data['distance']
                 
                 if using_meters:
-                    if target_distance > self.max_pass_distance or target_distance < 2.0:  # At least 2 meters
+                    if target_distance > self.max_pass_distance or target_distance < 2.0:  
                         if self.debug and frame_num % 50 == 0:
                             print(f"Frame {frame_num}: Skipping target {target_id} - distance {target_distance:.1f}m out of range")
                         continue
@@ -323,10 +319,8 @@ class PassLaneAnalyzer:
                         if self.debug and frame_num % 50 == 0:
                             print(f"Frame {frame_num}: Applying goalie penalty to target {target_id} - distance {target_distance:.1f}m")
                 
-                # Store lane data
                 pass_targets[target_id]['lane_width'] = lane_width
                 pass_targets[target_id]['lane_quality'] = lane_quality
-                # Store additional data for validation in drawing function
                 pass_targets[target_id]['is_goalie_pass'] = is_goalie
             
             best_target_id = None
@@ -367,7 +361,6 @@ class PassLaneAnalyzer:
                     'is_goalie_pass': is_goalie
                 }
                 
-                # Debug output for best pass option
                 if self.debug and frame_num % 50 == 0:
                     print(f"Frame {frame_num}: Best pass option to player {best_target_id} with lane width {pass_targets[best_target_id]['lane_width']:.2f}m and quality {best_lane_quality:.2f}")
             else:
@@ -424,17 +417,14 @@ class PassLaneAnalyzer:
     def _classify_team_by_color(self, player_data, frame=None, batch_frames=None, frame_num=0):
         player_id = player_data.get('id', 0)
         
-        # Check if team already assigned and cached
         if player_id in self.player_color_cache:
             return self.player_color_cache[player_id]
         
-        # Check if team info already in player data
         if 'team' in player_data:
             team_id = player_data['team']
             self.player_color_cache[player_id] = team_id
             return team_id
         
-        # Use TeamAssigner to get team
         if frame is not None and 'bbox' in player_data:
             try:
                 bbox = player_data['bbox']
@@ -445,7 +435,6 @@ class PassLaneAnalyzer:
                 if self.debug:
                     print(f"Error getting team using TeamAssigner: {e}")
         
-        # If single frame didn't work, try batch frames
         if batch_frames is not None and frame_num < len(batch_frames) and 'bbox' in player_data:
             try:
                 current_frame = batch_frames[frame_num]
@@ -457,18 +446,16 @@ class PassLaneAnalyzer:
                 if self.debug:
                     print(f"Error getting team using TeamAssigner for batch frame: {e}")
         
-        # Default if all else fails
         return 1
     
     def _calculate_lane_quality(self, carrier_pos, target_pos, defenders, using_meters=True):
         carrier = np.array(carrier_pos)
         target = np.array(target_pos)
         
-        # Calculate pass direction vector
         pass_vector = target - carrier
         pass_distance = np.linalg.norm(pass_vector)
         
-        if pass_distance < 0.001:  # Avoid division by zero
+        if pass_distance < 0.001:  
             return 0, 0
             
         pass_direction = pass_vector / pass_distance
@@ -508,7 +495,6 @@ class PassLaneAnalyzer:
     def draw_pass_lanes(self, frame, pass_lane_data, frame_num=None):
         frame_copy = frame.copy()
         
-        # Skip if no pass lane data or frame is invalid
         if not pass_lane_data or frame is None or frame.size == 0:
             if self.debug and frame_num is not None and frame_num % 50 == 0:
                 print(f"Frame {frame_num}: No pass lane data or invalid frame")
@@ -600,7 +586,7 @@ class PassLaneAnalyzer:
             carrier_pixel_pos = self._get_pixel_position(carrier_pos, frame_copy.shape)
             target_pixel_pos = self._get_pixel_position(target_pos, frame_copy.shape)
             
-            if self.debug and frame_copy.shape[0] > 500:  # Only print for actual video frames
+            if self.debug and frame_copy.shape[0] > 500:  
                 print(f"Player {carrier_id} (carrier) meter pos: {carrier_pos}, pixel pos: {carrier_pixel_pos}")
                 print(f"Player {target_id} (target) meter pos: {target_pos}, pixel pos: {target_pixel_pos}")
         else:
@@ -676,7 +662,7 @@ class PassLaneAnalyzer:
             return self._draw_pass_info_box(frame_copy, None)
                 
         try:
-            thickness = max(2, min(5, int(lane_quality * 10)))  # Cap thickness
+            thickness = max(2, min(5, int(lane_quality * 10)))  
                 
             if lane_quality > 0.7:
                 color = self.open_lane_color
@@ -769,7 +755,7 @@ class PassLaneAnalyzer:
             if not (np.isfinite(x) and np.isfinite(y)):
                 return False
                 
-            margin = 100  # pixels
+            margin = 100  
             height, width = frame_shape[:2]
             
             return (-margin <= x < width + margin and 
