@@ -391,14 +391,30 @@ class PassLaneAnalyzer:
                 if not (-10 <= x1 <= 120) or not (-10 <= y1 <= 80) or \
                    not (-10 <= x2 <= 120) or not (-10 <= y2 <= 80):
                     if self.debug:
-                        print(f"Warning: Potentially invalid meter coordinates: {pos1}, {pos2}")
+                        print(f"Invalid meter coordinates: {pos1}, {pos2}")
+                    return -1
+                    
+                max_field_distance = 120
+                dist = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+                if dist > max_field_distance:
+                    if self.debug:
+                        print(f"Unrealistic distance calculated: {dist}m, clamping")
+                    return max_field_distance
+                return dist
             else:
                 if not (0 <= x1 <= 1920) or not (0 <= y1 <= 1080) or \
                    not (0 <= x2 <= 1920) or not (0 <= y2 <= 1080):
                     if self.debug:
-                        print(f"Warning: Potentially invalid pixel coordinates: {pos1}, {pos2}")
-            
-            return np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+                        print(f"Invalid pixel coordinates: {pos1}, {pos2}")
+                    return -1
+                    
+                max_pixel_distance = 1920
+                dist = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+                if dist > max_pixel_distance:
+                    if self.debug:
+                        print(f"Unrealistic pixel distance calculated: {dist}, clamping")
+                    return max_pixel_distance
+                return dist
             
         except (TypeError, ValueError) as e:
             if self.debug:
@@ -485,13 +501,9 @@ class PassLaneAnalyzer:
         if using_meters and pass_distance > 15:
             distance_factor = max(0.5, 1 - ((pass_distance - 15) / 30))
         
-            return False
-            
-        margin = 100  # pixels
-        height, width = frame_shape[:2]
+        lane_quality *= distance_factor
         
-        return (-margin <= pos[0] < width + margin and 
-                -margin <= pos[1] < height + margin)
+        return lane_width, lane_quality
     
     def draw_pass_lanes(self, frame, pass_lane_data, frame_num=None):
         frame_copy = frame.copy()
@@ -747,6 +759,25 @@ class PassLaneAnalyzer:
             frame_copy = self._draw_pass_info_box(frame_copy, None)
         
         return frame_copy
+    
+    def _is_valid_position(self, pos, frame_shape):
+        if pos is None or len(pos) < 2:
+            return False
+            
+        try:
+            x, y = pos
+            if not (np.isfinite(x) and np.isfinite(y)):
+                return False
+                
+            margin = 100  # pixels
+            height, width = frame_shape[:2]
+            
+            return (-margin <= x < width + margin and 
+                    -margin <= y < height + margin)
+        except Exception as e:
+            if self.debug:
+                print(f"Error validating position: {e}")
+            return False
     
     def _get_pixel_position(self, meter_position, frame_shape):
         
